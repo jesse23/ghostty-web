@@ -88,7 +88,9 @@ Direct transmission of RGB / RGBA / PNG (optionally zlib-compressed) is supporte
 sizing, cropping and deletion. File and shared-memory transmission are answered with an error so programs
 fall back to direct, and unicode placeholders, animation and layering under text are not supported. The
 terminal itself does not know images are there, so text written over an image does not erase it; images are
-cleared with the screen, on alternate-screen switches and on reset. Sizes reported to programs are device
+cleared with the screen, on alternate-screen switches and on reset. Images are anchored to scrollback rows,
+which stops working once the scrollback is full (the terminal does not say how many rows it has evicted), so
+from then on an image on the main screen stays at its screen row instead of scrolling away with its text. Sizes reported to programs are device
 pixels, as in kitty and Ghostty. Memory limits (pixels per image, total decoded size, image count,
 transmission size) can be tuned with `new KittyGraphicsAddon({ limits })`.
 

@@ -37,6 +37,17 @@ interface FakeBitmap {
 
 let bitmaps: FakeBitmap[] = [];
 let gate: Promise<void> | null = null;
+// Gates for the next decodes, in the order they start: lets a test finish them in any order.
+let gates: Array<Promise<void>> = [];
+const hold = (): (() => void) => {
+  let release = () => {};
+  gates.push(
+    new Promise<void>((r) => {
+      release = r;
+    })
+  );
+  return release;
+};
 const saved: Record<string, unknown> = {};
 const g = globalThis as Record<string, unknown>;
 
@@ -58,6 +69,7 @@ const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 20));
 beforeEach(() => {
   bitmaps = [];
   gate = null;
+  gates = [];
   for (const key of ['createImageBitmap', 'ImageData']) saved[key] = g[key];
   saved.devicePixelRatio = window.devicePixelRatio;
   g.ImageData = class {
@@ -69,6 +81,8 @@ beforeEach(() => {
   };
   g.createImageBitmap = async (src: { width?: number; height?: number } | Blob) => {
     if (gate) await gate;
+    const own = gates.shift();
+    if (own) await own;
     if (src instanceof Blob) {
       const head = new Uint8Array(await src.arrayBuffer());
       const view = new DataView(head.buffer, head.byteOffset);
@@ -506,8 +520,9 @@ describe('memory limits', () => {
   );
 
   test('the total decoded size is a budget: the oldest go first, the newest stays', async () => {
-    // each 2x2 image is 16 bytes decoded; room for two
-    const h = await harness({ maxTotalBytes: 40 });
+    // each 2x2 image is 16 bytes decoded and, while decoding, holds 40 (16 of
+    // RGBA plus its 24-character payload): room for two stored plus one decoding
+    const h = await harness({ maxTotalBytes: 60 });
     for (const id of [1, 2, 3]) {
       h.term.write(apc(`a=T,f=32,s=2,v=2,i=${id},C=1`, zeros(16)));
       await flush();
@@ -529,9 +544,9 @@ describe('memory limits', () => {
   });
 
   test('a chunked transmission over the size cap gets one error and its later chunks are ignored', async () => {
-    const h = await harness({ maxTransmissionBytes: 10 });
-    h.term.write(apc('a=t,f=32,s=1,v=1,i=1,m=1', 'AAAAAA'));
-    h.term.write(apc('m=1', 'AAAAAA')); // 12 > 10: dropped
+    const h = await harness({ maxTransmissionBytes: 100 });
+    h.term.write(apc('a=t,f=32,s=1,v=1,i=1,m=1', 'A'.repeat(40)));
+    h.term.write(apc('m=1', 'A'.repeat(70))); // 110 > 100: dropped
     h.term.write(apc('m=1', 'AAAA'));
     expect(h.sent).toEqual([]);
     h.term.write(apc('m=0', 'AA'));
@@ -628,5 +643,261 @@ describe('lifecycle', () => {
     expect(placement.scale.x).toBeCloseTo(axisScale(h.cell.width, 2), 10);
     setDpr(1);
     expect(placement.scale.x).toBeCloseTo(axisScale(h.cell.width, 2), 10);
+  });
+});
+
+describe('an oversized sequence', () => {
+  test('is answered with an error and none of its payload reaches the terminal', async () => {
+    const h = await harness({ maxTransmissionBytes: 200 });
+    h.term.write(apc('a=t,f=32,s=1,v=1,i=1', 'A'.repeat(300)));
+    expect(h.sent).toEqual([`${ESC}_Gi=1;EINVAL:transmission too large${ESC}\\`]);
+    expect(line(h.term, 0)).toBe('');
+    expect(h.cursor()).toEqual({ x: 0, y: 0 });
+    expect(h.images().size).toBe(0);
+  });
+
+  test('the rest of a chunked transmission it started is ignored, with one error', async () => {
+    const h = await harness({ maxTransmissionBytes: 200 });
+    h.term.write(apc('a=t,f=32,s=1,v=1,i=1,m=1', 'A'.repeat(300)));
+    h.term.write(apc('m=1', 'AAAA'));
+    expect(h.sent).toEqual([]);
+    h.term.write(apc('m=0', 'AA'));
+    expect(h.sent).toEqual([`${ESC}_Gi=1;EINVAL:transmission too large${ESC}\\`]);
+  });
+
+  test('one that is never terminated is ended by CAN, and text resumes', async () => {
+    const h = await harness({ maxTransmissionBytes: 100 });
+    h.term.write(`${ESC}_Ga=t,i=1;${'A'.repeat(300)}`);
+    h.term.write('still payload');
+    expect(line(h.term, 0)).toBe('');
+    h.term.write('\x18text again');
+    expect(line(h.term, 0)).toBe('text again');
+  });
+});
+
+describe('decodes in flight', () => {
+  test('count against the memory budget, so a flood of transmissions is refused', async () => {
+    // each 2x2 image holds 40 while decoding: 16 of RGBA and a 24-character payload
+    const h = await harness({ maxTotalBytes: 100 });
+    const release = [hold(), hold()];
+    h.term.write(apc('a=t,f=32,s=2,v=2,i=1', zeros(16)) + apc('a=t,f=32,s=2,v=2,i=2', zeros(16)));
+    h.term.write(apc('a=t,f=32,s=2,v=2,i=3', zeros(16)));
+    expect(h.sent).toEqual([`${ESC}_Gi=3;EINVAL:too many images being decoded${ESC}\\`]);
+    expect(h.images().has(3)).toBe(false);
+    for (const r of release) r();
+    await flush();
+    h.sent.length = 0;
+    h.term.write(apc('a=t,f=32,s=2,v=2,i=4', zeros(16)));
+    await flush();
+    expect(h.images().get(4)?.bitmap).toBeDefined();
+  });
+
+  test('a compressed PNG, whose size is unknown until decoded, reserves the worst case', async () => {
+    // worst case: 100 pixels of RGBA (400 bytes) plus the payload
+    const h = await harness({ maxImagePixels: 100, maxTotalBytes: 500 });
+    const release = hold();
+    h.term.write(apc('a=t,f=100,o=z,i=1', b64(deflateSync(pngHeader(2, 2)))));
+    h.term.write(apc('a=t,f=100,o=z,i=2', b64(deflateSync(pngHeader(2, 2)))));
+    expect(h.sent).toEqual([`${ESC}_Gi=2;EINVAL:too many images being decoded${ESC}\\`]);
+    release();
+    await flush();
+  });
+
+  test('a failed decode releases its reservation', async () => {
+    const h = await harness({ maxTotalBytes: 500 });
+    const tooLittle = () => h.term.write(apc('a=t,f=32,s=10,v=10,i=1', zeros(8))); // reserves 412
+    tooLittle();
+    await flush();
+    h.sent.length = 0;
+    tooLittle(); // refused if the first still held its 412
+    await flush();
+    expect(h.sent).toEqual([`${ESC}_Gi=1;ENODATA:not enough pixel data${ESC}\\`]);
+  });
+});
+
+describe('every transmission is answered', () => {
+  test('one removed while it decodes gets an error instead of silence', async () => {
+    const h = await harness({ maxImages: 1 });
+    const releases = [hold(), hold()];
+    h.term.write(apc('a=t,f=32,s=1,v=1,i=1', zeros(4)));
+    h.term.write(apc('a=t,f=32,s=1,v=1,i=2', zeros(4))); // evicts image 1 while it decodes
+    for (const r of releases) r();
+    await flush();
+    expect(h.sent).toContain(
+      `${ESC}_Gi=1;EINVAL:image was removed before it finished decoding${ESC}\\`
+    );
+    expect(h.sent).toContain(`${ESC}_Gi=2;OK${ESC}\\`);
+    expect(h.images().has(1)).toBe(false);
+    expect(bitmaps[0].closed).toBe(true);
+  });
+
+  test('one deleted while it decodes gets the same error', async () => {
+    const h = await harness();
+    const release = hold();
+    h.term.write(apc('a=t,f=32,s=1,v=1,i=1', zeros(4)));
+    h.term.write(apc('a=d,d=I,i=1'));
+    release();
+    await flush();
+    expect(h.sent).toEqual([
+      `${ESC}_Gi=1;EINVAL:image was removed before it finished decoding${ESC}\\`,
+    ]);
+  });
+
+  test('one superseded by a newer transmission that already finished still gets its OK', async () => {
+    const h = await harness();
+    const releaseOld = hold();
+    const releaseNew = hold();
+    h.term.write(apc('a=t,f=32,s=1,v=1,i=1', zeros(4)));
+    h.term.write(apc('a=t,f=32,s=2,v=2,i=1', zeros(16)));
+    releaseNew();
+    await flush();
+    expect(h.images().get(1)?.bitmap).toMatchObject({ width: 2 });
+    releaseOld();
+    await flush();
+    expect(h.sent).toEqual([`${ESC}_Gi=1;OK${ESC}\\`, `${ESC}_Gi=1;OK${ESC}\\`]);
+    expect(bitmaps.find((b) => b.width === 1)?.closed).toBe(true);
+    expect(h.images().get(1)?.bitmap).toMatchObject({ width: 2, closed: false });
+  });
+
+  test('an older transmission that finishes first is shown until the newer one is ready', async () => {
+    const h = await harness();
+    const releaseOld = hold();
+    const releaseNew = hold();
+    h.term.write(apc('a=T,f=32,s=1,v=1,i=1,C=1', zeros(4)));
+    h.term.write(apc('a=T,f=32,s=2,v=2,i=1,C=1', zeros(16)));
+    releaseOld();
+    await flush();
+    expect(h.images().get(1)?.bitmap).toMatchObject({ width: 1 });
+    releaseNew();
+    await flush();
+    expect(h.images().get(1)?.bitmap).toMatchObject({ width: 2 });
+    expect(bitmaps[0].closed).toBe(true);
+  });
+
+  test('dispose() answers nothing for decodes that were running', async () => {
+    const h = await harness();
+    const release = hold();
+    h.term.write(apc('a=t,f=32,s=1,v=1,i=1', zeros(4)));
+    h.addon.dispose();
+    release();
+    await flush();
+    expect(h.sent).toEqual([]);
+  });
+});
+
+describe('placements are sized from the current transmission', () => {
+  test('a=p of a compressed PNG replacing a decoded image does not borrow the old bitmap size', async () => {
+    const h = await harness();
+    const one = h.cells(1, 1);
+    h.term.write(apc(`a=T,f=32,${one.keys},i=1,C=1`, one.payload));
+    await flush();
+    const release = hold();
+    h.term.write(apc('a=t,f=100,o=z,i=1', b64(deflateSync(pngHeader(20, 40)))));
+    h.sent.length = 0;
+    h.term.write(apc('a=p,i=1'));
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]).toContain('C=1');
+    expect(h.cursor()).toEqual({ x: 0, y: 0 });
+    release();
+    await flush();
+  });
+
+  test('a=p of a resized image moves the cursor by the new size, not the old bitmap', async () => {
+    const h = await harness();
+    const one = h.cells(1, 1);
+    h.term.write(apc(`a=T,f=32,${one.keys},i=1,C=1`, one.payload));
+    await flush();
+    const release = hold();
+    const big = h.cells(4, 2);
+    h.term.write(apc(`a=t,f=32,${big.keys},i=1`, big.payload));
+    h.term.write(apc('a=p,i=1'));
+    expect(h.cursor()).toEqual({ x: 4, y: 1 });
+    release();
+    await flush();
+  });
+});
+
+describe('eviction order', () => {
+  test('enforcing the budget keeps the newest transmission, whichever decode finished last', async () => {
+    const h = await harness();
+    for (const id of [1, 2, 3]) {
+      h.term.write(apc(`a=t,f=32,s=2,v=2,i=${id}`, zeros(16)));
+      await flush();
+    }
+    const internals = h.addon as unknown as {
+      limits: KittyGraphicsLimits;
+      enforceBudget(): boolean;
+    };
+    internals.limits.maxTotalBytes = 20;
+    internals.enforceBudget();
+    expect([...h.images().keys()]).toEqual([3]);
+  });
+});
+
+describe('overlay repaint when the tab is shown again', () => {
+  const setVisibility = (state: string) =>
+    Object.defineProperty(document, 'visibilityState', { value: state, configurable: true });
+
+  afterEach(() => setVisibility('visible'));
+
+  test('a tab coming back to the foreground repaints the overlay', async () => {
+    const h = await harness();
+    h.clearDirty();
+    setVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(h.dirty()).toBe(false);
+    setVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(h.dirty()).toBe(true);
+  });
+
+  test('invalidate() forces a repaint even when nothing about the geometry changed', async () => {
+    const h = await harness();
+    (h.addon as unknown as { lastSignature: string }).lastSignature = 'same';
+    h.clearDirty();
+    h.addon.invalidate();
+    expect(h.dirty()).toBe(true);
+    expect((h.addon as unknown as { lastSignature: string }).lastSignature).toBe('');
+  });
+
+  test('dispose() stops listening', async () => {
+    const h = await harness();
+    h.addon.dispose();
+    h.clearDirty();
+    setVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(h.dirty()).toBe(false);
+  });
+});
+
+describe('a header that only looks like a PNG', () => {
+  test.each([
+    [
+      'signature',
+      (b: Uint8Array) => {
+        b[0] = 0x00;
+      },
+    ],
+    [
+      'IHDR length',
+      (b: Uint8Array) => {
+        b[11] = 12;
+      },
+    ],
+    [
+      'IHDR type',
+      (b: Uint8Array) => {
+        b[15] = 0x58;
+      },
+    ],
+  ])('with a bad %s is refused before the cursor moves', async (_name, corrupt) => {
+    const h = await harness();
+    const bad = pngHeader(20, 40);
+    corrupt(bad);
+    h.term.write(apc('a=T,f=100,i=1', b64(bad)));
+    expect(h.sent).toEqual([`${ESC}_Gi=1;EINVAL:not a PNG${ESC}\\`]);
+    expect(h.cursor()).toEqual({ x: 0, y: 0 });
+    expect(h.placements().size).toBe(0);
+    expect(h.images().size).toBe(0);
   });
 });

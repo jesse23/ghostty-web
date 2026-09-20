@@ -25,7 +25,11 @@
  * animation, and layering under text (images are drawn above it).
  *
  * The terminal does not know images exist, so text written over an image does
- * not erase it. Placements are dropped when the screen is cleared, on
+ * not erase it. Placements are anchored to the scrollback length plus a row;
+ * that length stops growing once the scrollback is full, and the terminal
+ * exposes no count of the rows it has evicted, so from then on a main-screen
+ * placement stays at its screen row instead of scrolling away with its text
+ * (the alternate screen is not affected). Placements are dropped when the screen is cleared, on
  * alternate-screen switches and on full reset, which is what full-screen
  * programs rely on.
  *
@@ -109,7 +113,9 @@ interface StoredImage {
   // Decoded size in bytes, counted against `maxTotalBytes`.
   bytes: number;
   // Decodes can finish out of order when frames arrive faster than they
-  // decode; only the newest transmission may replace the bitmap.
+  // decode. A bitmap never replaces one from a newer transmission, but an
+  // older one that finishes first is shown until the newer is ready: dropping
+  // it would leave a stream of frames blank whenever decoding lags behind.
   latest: number;
   applied: number;
 }
@@ -239,11 +245,14 @@ function textToBytes(text: string): Uint8Array {
 export class KittyGraphicsAddon implements ITerminalAddon {
   private term?: Terminal;
   private limits: KittyGraphicsLimits;
-  private splitter = new ApcSplitter();
+  private splitter: ApcSplitter;
   private assembler: ChunkAssembler;
   private scanner = new ControlScanner();
   private images = new Map<number, StoredImage>();
   private totalBytes = 0;
+  // Encoded payloads and RGBA output of decodes that have not finished, which
+  // hold memory just as stored images do and count against the same budget.
+  private inFlightBytes = 0;
   private placements = new Map<string, Placement>();
   private anonymousId = 0;
   // Bumped by reset() and dispose(). Decodes that started under an older
@@ -259,6 +268,7 @@ export class KittyGraphicsAddon implements ITerminalAddon {
 
   constructor(options: KittyGraphicsOptions = {}) {
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
+    this.splitter = new ApcSplitter(this.limits.maxTransmissionBytes);
     this.assembler = new ChunkAssembler(this.limits.maxTransmissionBytes);
   }
 
@@ -267,11 +277,26 @@ export class KittyGraphicsAddon implements ITerminalAddon {
     this.term = terminal as Terminal;
     this.term.attachCustomWriteHandler((data, write) => this.handleWrite(data, write));
     this.frame = requestAnimationFrame(this.tick);
+    // Chromium can discard a canvas's contents while its tab is hidden. The
+    // overlay's geometry does not change when the tab comes back, so nothing
+    // else would make it repaint.
+    document.addEventListener('visibilitychange', this.onVisibility);
+  }
+
+  private onVisibility = (): void => {
+    if (document.visibilityState === 'visible') this.invalidate();
+  };
+
+  /** Repaint the overlay on the next frame, whatever has or has not changed. */
+  public invalidate(): void {
+    this.dirty = true;
+    this.lastSignature = '';
   }
 
   /** Dispose the addon: stop intercepting output, free images, remove the overlay */
   public dispose(): void {
     this.generation++;
+    document.removeEventListener('visibilitychange', this.onVisibility);
     this.term?.attachCustomWriteHandler(undefined);
     this.term = undefined;
     if (this.frame !== undefined) cancelAnimationFrame(this.frame);
@@ -291,7 +316,7 @@ export class KittyGraphicsAddon implements ITerminalAddon {
    */
   public reset(): void {
     this.generation++;
-    this.splitter = new ApcSplitter();
+    this.splitter = new ApcSplitter(this.limits.maxTransmissionBytes);
     this.assembler = new ChunkAssembler(this.limits.maxTransmissionBytes);
     this.scanner = new ControlScanner();
     this.dropImages();
@@ -308,7 +333,7 @@ export class KittyGraphicsAddon implements ITerminalAddon {
     try {
       for (const seg of this.splitter.feed(binary ? bytesToText(data) : data)) {
         if (seg.type === 'text') this.writeText(seg.text, binary);
-        else this.handleApc(seg.body);
+        else this.handleApc(seg.body, seg.overflow);
       }
     } finally {
       this.out = () => {};
@@ -327,10 +352,11 @@ export class KittyGraphicsAddon implements ITerminalAddon {
     this.term?.input(data, true);
   }
 
-  private handleApc(body: string): void {
+  private handleApc(body: string, overflow = false): void {
     const cmd = parseKittyApc(body);
     if (!cmd) return;
-    const tx = this.assembler.push(cmd);
+    // An oversized sequence arrives as its start only: enough to answer it.
+    const tx = overflow ? this.assembler.reject(cmd) : this.assembler.push(cmd);
     if (!tx) return;
     const action = tx.keys.a ?? 't';
     try {
@@ -399,6 +425,16 @@ export class KittyGraphicsAddon implements ITerminalAddon {
     // move at this exact point in the stream, so it cannot be moved for one.
     if (display) this.assertCursorMovable(tx.keys, size);
 
+    // What this transmission holds while it decodes: its encoded payload and the
+    // RGBA it will produce (the worst case when only the decode can tell).
+    // Stored images make room for it; if it still does not fit, it is refused.
+    const known = size.width && size.height;
+    const reserved =
+      tx.data.length + (known ? size.width * size.height : this.limits.maxImagePixels) * 4;
+    if (!this.enforceBudget(false, reserved)) {
+      throw new KittyError('EINVAL', 'too many images being decoded');
+    }
+
     const explicit = this.imageIdOf(tx.keys);
     const id = explicit || --this.anonymousId;
     const gen = this.generation;
@@ -408,6 +444,8 @@ export class KittyGraphicsAddon implements ITerminalAddon {
     const slot = this.images.get(id) ?? { width: 0, height: 0, bytes: 0, latest: 0, applied: 0 };
     this.images.delete(id); // re-insert so the Map stays ordered by recency
     this.images.set(id, slot);
+    // The size of this transmission, not of any bitmap still held from the
+    // previous one: placements are sized from it.
     slot.width = size.width;
     slot.height = size.height;
     this.evict();
@@ -417,23 +455,48 @@ export class KittyGraphicsAddon implements ITerminalAddon {
     // waits for the bitmap.
     if (display) this.place(tx.keys, id);
 
+    // Every path below ends the transmission with a reply, except when the
+    // stream it belongs to has been reset: nobody is waiting for it any more.
+    this.inFlightBytes += reserved;
     decode(tx.keys, tx.data, this.limits.maxImagePixels).then(
       (bitmap) => {
-        if (gen !== this.generation || seq <= slot.applied || this.images.get(id) !== slot) {
+        this.inFlightBytes -= reserved;
+        if (gen !== this.generation) {
           bitmap.close();
+          return;
+        }
+        if (this.images.get(id) !== slot) {
+          bitmap.close();
+          this.replyError(
+            tx.keys,
+            new KittyError('EINVAL', 'image was removed before it finished decoding')
+          );
+          return;
+        }
+        if (seq <= slot.applied) {
+          // A newer transmission is already showing. This one was valid.
+          bitmap.close();
+          this.reply(tx.keys, explicit ? id : 0);
           return;
         }
         slot.bitmap?.close();
         slot.bitmap = bitmap;
         slot.applied = seq;
+        // For the newest transmission the decode is what tells a compressed
+        // PNG's size, which a later a=p is placed from.
+        if (seq === slot.latest) {
+          slot.width = bitmap.width;
+          slot.height = bitmap.height;
+        }
         const bytes = bitmap.width * bitmap.height * 4;
         this.totalBytes += bytes - slot.bytes;
         slot.bytes = bytes;
-        this.enforceBudget(id);
+        this.enforceBudget();
         this.dirty = true;
         this.reply(tx.keys, explicit ? id : 0);
       },
       (e) => {
+        this.inFlightBytes -= reserved;
         if (gen !== this.generation) return;
         // The newest transmission failed: nothing it placed can be drawn, and
         // an image that never decoded is not worth keeping.
@@ -451,7 +514,11 @@ export class KittyGraphicsAddon implements ITerminalAddon {
     if (num(tx.keys, 'f', 32) !== 100) {
       return { width: num(tx.keys, 's'), height: num(tx.keys, 'v') };
     }
-    return (tx.keys.o !== 'z' && pngSize(tx.data)) || { width: 0, height: 0 };
+    // A compressed PNG's size is only known once it is inflated.
+    if (tx.keys.o === 'z') return { width: 0, height: 0 };
+    const size = pngSize(tx.data);
+    if (!size) throw new KittyError('EINVAL', 'not a PNG');
+    return size;
   }
 
   private assertCursorMovable(keys: KittyKeys, size: { width: number; height: number }): void {
@@ -462,8 +529,9 @@ export class KittyGraphicsAddon implements ITerminalAddon {
   private place(keys: KittyKeys, imageId: number): void {
     const term = this.term;
     if (!term) return;
-    const slot = this.images.get(imageId);
-    const image = slot?.bitmap ?? slot ?? { width: 0, height: 0 };
+    // Sized from the slot, which describes the latest transmission; a bitmap
+    // can still be the previous transmission's while this one decodes.
+    const image = this.images.get(imageId) ?? { width: 0, height: 0 };
     this.assertCursorMovable(keys, image);
     const buf = term.buffer.active;
     const cell = this.cell();
@@ -557,12 +625,20 @@ export class KittyGraphicsAddon implements ITerminalAddon {
     }
   }
 
-  /** Drops the oldest images, never `keep`, until the decoded total fits. */
-  private enforceBudget(keep: number): void {
-    for (const id of [...this.images.keys()]) {
-      if (this.totalBytes <= this.limits.maxTotalBytes) return;
-      if (id !== keep) this.dropImage(id);
+  /**
+   * Drops the oldest images until stored plus in-flight bytes, and `extra`
+   * more, fit the budget; the most recent transmission is kept unless
+   * `protectNewest` is false. Returns whether it fits.
+   */
+  private enforceBudget(protectNewest = true, extra = 0): boolean {
+    const fits = () => this.totalBytes + this.inFlightBytes + extra <= this.limits.maxTotalBytes;
+    const ids = [...this.images.keys()];
+    if (protectNewest) ids.pop();
+    for (const id of ids) {
+      if (fits()) return true;
+      this.dropImage(id);
     }
+    return fits();
   }
 
   private reply(keys: KittyKeys, id: number): void {
